@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"os/exec" // 新增：用于调用 proxy_logger_fd.py
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,21 +22,33 @@ var (
 	mode         string
 	transparent  bool
 	disableMPTCP bool
+        logLevel     string // Add a command-line option to set log level
+	taskCounter  int = 0 // 新增：每次连接递增 task_id（用于 logger 记录）
 )
 
 func main() {
-	if log.GetLevel() == log.DebugLevel {
-		log.SetReportCaller(true)
-	}
-
 	var err error
 
 	flag.BoolVarP(&transparent, "transparent", "t", false, "Enable transparent mode")
 	flag.StringVarP(&mode, "mode", "m", "", "specify mode (server or client)")
 	flag.IntVarP(&localPort, "port", "p", 0, "local bind port")
 	flag.BoolVar(&disableMPTCP, "disable-mptcp", false, "Disable MPTCP")
+        flag.StringVar(&logLevel, "log-level", "info", "Set log level: debug, info, warn, error") // New: log-level flag
 	var rAddr *string = flag.StringP("remote", "r", "", "remote address (ex. 127.0.0.1:8080)")
 	flag.Parse()
+
+        // Parse and apply log level
+	level, err := log.ParseLevel(logLevel)
+	if err != nil {
+		log.Warnf("Invalid log level '%s', defaulting to info", logLevel)
+		level = log.InfoLevel
+	}
+	log.SetLevel(level)
+
+	// Enable caller reporting in debug mode
+	if level == log.DebugLevel {
+		log.SetReportCaller(true)
+	}
 
 	if localPort == 0 || mode == "" {
 		flag.Usage()
@@ -137,6 +150,12 @@ func doProxy(bindProtocol, connectProtocol int) {
 			log.Error(err)
 			return
 		}
+                // Bind the socket explicitly to the 'upfgtp' network interface
+                err = syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, "upfgtp")
+                if err != nil {
+                        log.Errorf("Failed to bind socket to device upfgtp: %v", err)
+                        return
+                }
 	} else {
 		bindAddr.Addr = [4]byte{0, 0, 0, 0}
 	}
@@ -153,7 +172,9 @@ func doProxy(bindProtocol, connectProtocol int) {
 	log.Printf("Started to listening...")
 
 	for {
+                log.Infof("Waiting to accept connections on port %d...", localPort)
 		fd2, rAddr, err := syscall.Accept(fd)
+                log.Infof("Accept returned: fd=%d, err=%v", fd2, err)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -172,6 +193,19 @@ func doProxy(bindProtocol, connectProtocol int) {
 			copy(remoteSockAddr.Addr[:], remoteAddr.To4())
 			remoteSockAddr.Port = remotePort
 		}
+
+		// 新增：调用 logger 脚本
+		go func(taskID, fdCopy int) {
+			cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py", 
+				"--fd", strconv.Itoa(fdCopy), 
+				"--task", strconv.Itoa(taskID))
+			err := cmd.Run()
+			if err != nil {
+				log.Errorf("logger failed: %v", err)
+			}
+		}(taskCounter, fd2)
+
+		taskCounter++ // 每次连接后 task_id +1
 
 		go handleConnection(fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
 	}
