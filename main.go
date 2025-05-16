@@ -3,13 +3,14 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"        // 用于包装 fd
+	"os/exec" // 新增：用于调用 proxy_logger_fd.py
 	"strconv"
 	"strings"
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
 	flag "github.com/spf13/pflag"
-	"github.com/naoki9911/mptcp-proxy/mpsched" // ✅ 加这行
 )
 
 const IPPROTO_MPTCP = 262
@@ -23,6 +24,7 @@ var (
 	transparent  bool
 	disableMPTCP bool
         logLevel     string // Add a command-line option to set log level
+	taskCounter  int = 0 // 新增：每次连接递增 task_id（用于 logger 记录）
 )
 
 func main() {
@@ -193,11 +195,35 @@ func doProxy(bindProtocol, connectProtocol int) {
 			remoteSockAddr.Port = remotePort
 		}
 
+		// —— 从这里开始替换 —— 
+go func(taskID, origFd int) {
+    // 1）把 fd 包装成 *os.File
+    sockFile := os.NewFile(uintptr(origFd), fmt.Sprintf("proxy-socket-%d", origFd))
+
+    // 2）告诉 Python：它在子进程里要用 fd=3
+    cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
+        "--fd", "3",                         // 固定传 3
+        "--task", strconv.Itoa(taskID),
+    )
+
+    // 3）ExtraFiles[0] 会变成子进程的 fd 3
+    cmd.ExtraFiles = []*os.File{ sockFile }
+
+    // 4）运行并获取输出，方便调试
+    out, err := cmd.CombinedOutput()
+    if err != nil {
+        log.Errorf("logger failed: %v\noutput: %s", err, string(out))
+    } else {
+        log.Infof("logger output: %s", string(out))
+    }
+}(taskCounter, fd2)
+taskCounter++
+// —— 替换到这里结束 —— 
+
 		go handleConnection(fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
 	}
 }
 
-/*
 func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
 	defer syscall.Close(fd)
 
@@ -241,75 +267,6 @@ func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol i
 	log.Printf("proxy finished(%s)", endpoints)
 	return nil
 }
-*/
-func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
-	defer syscall.Close(fd)
-
-	// 引入 MPTCP 子流提取模块
-	imported := false
-	if !imported {
-		imported = true
-	}
-	// 引入 mpsched 模块（你 main.go 顶部要加： "github.com/naoki9911/mptcp-proxy/mpsched"）
-
-	// Outgoing socket，禁用 MPTCP
-	rFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	defer syscall.Close(rFd)
-
-	const MPTCP_ENABLED = 42
-	err = syscall.SetsockoptInt(rFd, syscall.IPPROTO_TCP, MPTCP_ENABLED, 0)
-	if err != nil {
-		log.Warnf("Disabling MPTCP may not be supported: %v", err)
-	}
-
-	err = syscall.SetsockoptInt(rFd, syscall.SOL_TCP, syscall.TCP_NODELAY, 1)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-
-	// ✅ 在转发前调用 persist_state，让内核记录子流状态
-	if err := mpsched.PersistState(fd); err != nil {
-		log.Warnf("PersistState failed: %v", err)
-	}
-
-	err = syscall.Connect(rFd, dst)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-
-	srcAddr := net.IPv4(src.Addr[0], src.Addr[1], src.Addr[2], src.Addr[3])
-	dstAddr := net.IPv4(dst.Addr[0], dst.Addr[1], dst.Addr[2], dst.Addr[3])
-	endpoints := fmt.Sprintf("src=%s:%d dst=%s:%d", srcAddr.String(), src.Port, dstAddr.String(), dst.Port)
-	log.Infof("Connected to remote (%s)", endpoints)
-
-	// ✅ 启动流量转发
-	err = copyFdStream(fd, rFd)
-	if err != nil {
-		log.Error(err)
-	}
-
-	log.Infof("Proxy finished (%s)", endpoints)
-
-	// ✅ 获取 MPTCP 子流指标
-	subflows, err := mpsched.GetSubInfo(fd)
-	if err != nil {
-		log.Warnf("GetSubInfo failed: %v", err)
-	} else {
-		for i, sub := range subflows {
-			log.Infof("[Subflow %d] SegsOut=%d RTT=%d cwnd=%d unacked=%d retrans=%d dst_ip=%d ofo=%d snd_wnd=%d",
-				i, sub[0], sub[1], sub[2], sub[3], sub[4], sub[5], sub[6], sub[7])
-		}
-	}
-
-	return nil
-}
-
 
 func isEpollEventFlagged(events []syscall.EpollEvent, fd int, flag int) bool {
 	for _, event := range events {
