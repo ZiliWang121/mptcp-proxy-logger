@@ -1,55 +1,128 @@
 package main
 
 import (
-//	"fmt"
+	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
 	flag "github.com/spf13/pflag"
+	"github.com/naoki9911/mptcp-proxy/mpsched" // ✅ 加这行
 )
 
 const IPPROTO_MPTCP = 262
 const BUF_SIZE = 65536
-const SO_ORIGINAL_DST = 80
 
 var (
-	localPort int
-	logLevel  string
+	remoteAddr   net.IP
+	remotePort   int
+	localPort    int
+	mode         string
+	transparent  bool
+	disableMPTCP bool
+        logLevel     string // Add a command-line option to set log level
 )
 
 func main() {
+	var err error
+
+	flag.BoolVarP(&transparent, "transparent", "t", false, "Enable transparent mode")
+	flag.StringVarP(&mode, "mode", "m", "", "specify mode (server or client)")
 	flag.IntVarP(&localPort, "port", "p", 0, "local bind port")
-	flag.StringVar(&logLevel, "log-level", "info", "Set log level: debug, info, warn, error")
+	flag.BoolVar(&disableMPTCP, "disable-mptcp", false, "Disable MPTCP")
+        flag.StringVar(&logLevel, "log-level", "info", "Set log level: debug, info, warn, error") // New: log-level flag
+	var rAddr *string = flag.StringP("remote", "r", "", "remote address (ex. 127.0.0.1:8080)")
 	flag.Parse()
 
+        // Parse and apply log level
 	level, err := log.ParseLevel(logLevel)
 	if err != nil {
 		log.Warnf("Invalid log level '%s', defaulting to info", logLevel)
 		level = log.InfoLevel
 	}
 	log.SetLevel(level)
+
+	// Enable caller reporting in debug mode
 	if level == log.DebugLevel {
 		log.SetReportCaller(true)
 	}
 
-	if localPort == 0 {
+	if localPort == 0 || mode == "" {
 		flag.Usage()
 		return
 	}
 
-	log.Infof("starting proxy on port %d...", localPort)
-	doProxy(IPPROTO_MPTCP, syscall.IPPROTO_IP)
+	if mode != "server" && mode != "client" {
+		flag.Usage()
+		return
+	}
+
+	if !transparent {
+		if *rAddr == "" {
+			flag.Usage()
+			return
+		}
+		addrs := strings.Split(*rAddr, ":")
+		if len(addrs) != 2 {
+			flag.Usage()
+			return
+		}
+
+		remoteAddr = net.ParseIP(addrs[0])
+		if remoteAddr == nil {
+			resolvedAddr, err := net.ResolveIPAddr("ip4", addrs[0])
+			if err != nil {
+				log.Error(err)
+				flag.Usage()
+				return
+			}
+			remoteAddr = resolvedAddr.IP.To4()
+		}
+
+		remotePort, err = strconv.Atoi(addrs[1])
+		if err != nil {
+			flag.Usage()
+			return
+		}
+	}
+
+	log.Infof("starting proxy...")
+	if disableMPTCP {
+		doProxy(syscall.IPPROTO_IP, syscall.IPPROTO_IP)
+	} else {
+		if mode == "client" {
+			doProxy(syscall.IPPROTO_IP, IPPROTO_MPTCP)
+		} else if mode == "server" {
+			doProxy(IPPROTO_MPTCP, syscall.IPPROTO_IP)
+		}
+	}
+
+	log.Errorf("mode %s is not supported", mode)
 }
 
+const SO_ORIGINAL_DST = 80
+
 func getOriginalDestination(sockfd int) (net.IP, int, error) {
+	// this code is copied from https://gist.github.com/fangdingjun/11e5d63abe9284dc0255a574a76bbcb1
+
+	// Get original destination
+	// this is the only syscall in the Golang libs that I can find that returns 16 bytes
+	// Example result: &{Multiaddr:[2 0 31 144 206 190 36 45 0 0 0 0 0 0 0 0] Interface:0}
+	// port starts at the 3rd byte and is 2 bytes long (31 144 = port 8080)
+	// IPv6 version, didn't find a way to detect network family
+	//addr, err := syscall.GetsockoptIPv6Mreq(int(clientConnFile.Fd()), syscall.IPPROTO_IPV6, IP6T_SO_ORIGINAL_DST)
+	// IPv4 address starts at the 5th byte, 4 bytes long (206 190 36 45)
 	addr, err := syscall.GetsockoptIPv6Mreq(sockfd, syscall.IPPROTO_IP, SO_ORIGINAL_DST)
 	log.Debugf("getOriginalDst(): SO_ORIGINAL_DST=%+v\n", addr)
 	if err != nil {
 		return nil, 0, err
 	}
+
 	ip := net.IPv4(addr.Multiaddr[4], addr.Multiaddr[5], addr.Multiaddr[6], addr.Multiaddr[7])
 	port := int(addr.Multiaddr[2])<<8 | int(addr.Multiaddr[3])
+
 	return ip, port, nil
 }
 
@@ -65,54 +138,121 @@ func doProxy(bindProtocol, connectProtocol int) {
 		log.Fatal(err)
 	}
 
-	err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TRANSPARENT, 1)
-	if err != nil {
-		log.Fatalf("Failed to set IP_TRANSPARENT: %v", err)
-	}
-
-	err = syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, "upfgtp")
-	if err != nil {
-		log.Fatalf("Failed to bind to device 'upfgtp': %v", err)
-	}
-
 	bindAddr := syscall.SockaddrInet4{
 		Port: localPort,
-		Addr: [4]byte{0, 0, 0, 0},
 	}
-	if err := syscall.Bind(fd, &bindAddr); err != nil {
+
+	if transparent {
+                bindAddr.Addr = [4]byte{0, 0, 0, 0}
+		err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TRANSPARENT, 1)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+                // Bind the socket explicitly to the 'upfgtp' network interface
+                err = syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, "upfgtp")
+                if err != nil {
+                        log.Errorf("Failed to bind socket to device upfgtp: %v", err)
+                        return
+                }
+	} else {
+		bindAddr.Addr = [4]byte{0, 0, 0, 0}
+	}
+
+	err = syscall.Bind(fd, &bindAddr)
+	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := syscall.Listen(fd, 5); err != nil {
+	err = syscall.Listen(fd, 5)
+	if err != nil {
 		log.Fatal(err)
 	}
-	log.Infof("Listening on port %d", localPort)
+	log.Printf("Started to listening...")
 
 	for {
+                log.Infof("Waiting to accept connections on port %d...", localPort)
 		fd2, rAddr, err := syscall.Accept(fd)
-		log.Infof("Accept returned: fd=%d, err=%v", fd2, err)
+                log.Infof("Accept returned: fd=%d, err=%v", fd2, err)
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Printf("Accepted connection (fd=%d)", fd2)
 
-		ip, port, err := getOriginalDestination(fd2)
-		if err != nil {
-			log.Printf("failed to get original destination: %s", err)
-			continue
+		remoteSockAddr := &syscall.SockaddrInet4{}
+		if transparent {
+			ip, port, err := getOriginalDestination(fd2)
+			if err != nil {
+				log.Printf("failed to get original destination %s", err)
+				continue
+			}
+			copy(remoteSockAddr.Addr[:], ip.To4())
+			remoteSockAddr.Port = port
+		} else {
+			copy(remoteSockAddr.Addr[:], remoteAddr.To4())
+			remoteSockAddr.Port = remotePort
 		}
-		remoteSockAddr := &syscall.SockaddrInet4{
-			Port: port,
-		}
-		copy(remoteSockAddr.Addr[:], ip.To4())
 
 		go handleConnection(fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
 	}
 }
 
+/*
 func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
 	defer syscall.Close(fd)
 
+	// Always use standard TCP for the outgoing socket
+	rFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+	defer syscall.Close(rFd)
+
+	// Explicitly disable MPTCP (in case mptcp_enabled=2 is set globally)
+	const MPTCP_ENABLED = 42
+	err = syscall.SetsockoptInt(rFd, syscall.IPPROTO_TCP, MPTCP_ENABLED, 0)
+	if err != nil {
+		log.Warnf("Disabling MPTCP may not be supported: %v", err)
+	}
+
+	err = syscall.SetsockoptInt(rFd, syscall.SOL_TCP, syscall.TCP_NODELAY, 1)
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+
+	err = syscall.Connect(rFd, dst)
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+
+	srcAddr := net.IPv4(src.Addr[0], src.Addr[1], src.Addr[2], src.Addr[3])
+	dstAddr := net.IPv4(dst.Addr[0], dst.Addr[1], dst.Addr[2], dst.Addr[3])
+	endpoints := fmt.Sprintf("src=%s:%d dst=%s:%d", srcAddr.String(), src.Port, dstAddr.String(), dst.Port)
+	log.Printf("connected to remote(%s)", endpoints)
+
+	err = copyFdStream(fd, rFd)
+	if err != nil {
+		log.Error(err)
+	}
+
+	log.Printf("proxy finished(%s)", endpoints)
+	return nil
+}
+*/
+func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
+	defer syscall.Close(fd)
+
+	// 引入 MPTCP 子流提取模块
+	imported := false
+	if !imported {
+		imported = true
+	}
+	// 引入 mpsched 模块（你 main.go 顶部要加： "github.com/naoki9911/mptcp-proxy/mpsched"）
+
+	// Outgoing socket，禁用 MPTCP
 	rFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
 	if err != nil {
 		log.Error(err)
@@ -132,30 +272,58 @@ func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol i
 		return err
 	}
 
-	if err := syscall.Connect(rFd, dst); err != nil {
+	// ✅ 在转发前调用 persist_state，让内核记录子流状态
+	if err := mpsched.PersistState(fd); err != nil {
+		log.Warnf("PersistState failed: %v", err)
+	}
+
+	err = syscall.Connect(rFd, dst)
+	if err != nil {
 		log.Error(err)
 		return err
 	}
 
 	srcAddr := net.IPv4(src.Addr[0], src.Addr[1], src.Addr[2], src.Addr[3])
 	dstAddr := net.IPv4(dst.Addr[0], dst.Addr[1], dst.Addr[2], dst.Addr[3])
-	log.Infof("Connected: %s:%d → %s:%d", srcAddr, src.Port, dstAddr, dst.Port)
+	endpoints := fmt.Sprintf("src=%s:%d dst=%s:%d", srcAddr.String(), src.Port, dstAddr.String(), dst.Port)
+	log.Infof("Connected to remote (%s)", endpoints)
 
+	// ✅ 启动流量转发
 	err = copyFdStream(fd, rFd)
 	if err != nil {
 		log.Error(err)
 	}
 
-	log.Infof("Proxy finished (%s:%d)", srcAddr, src.Port)
+	log.Infof("Proxy finished (%s)", endpoints)
+
+	// ✅ 获取 MPTCP 子流指标
+	subflows, err := mpsched.GetSubInfo(fd)
+	if err != nil {
+		log.Warnf("GetSubInfo failed: %v", err)
+	} else {
+		for i, sub := range subflows {
+			log.Infof("[Subflow %d] SegsOut=%d RTT=%d cwnd=%d unacked=%d retrans=%d dst_ip=%d ofo=%d snd_wnd=%d",
+				i, sub[0], sub[1], sub[2], sub[3], sub[4], sub[5], sub[6], sub[7])
+		}
+	}
+
 	return nil
 }
 
+
 func isEpollEventFlagged(events []syscall.EpollEvent, fd int, flag int) bool {
 	for _, event := range events {
-		if int(event.Fd) == fd && int(event.Events)&flag > 0 {
+		if int(event.Fd) != fd {
+			continue
+		}
+
+		if int(event.Events)&flag > 0 {
 			return true
+		} else {
+			return false
 		}
 	}
+
 	return false
 }
 
@@ -172,52 +340,108 @@ func copyFdStream(fd1 int, fd2 int) error {
 	}
 	defer syscall.Close(epWritefd)
 
-	register := func(epfd int, fd int, flags uint32) {
-		event := syscall.EpollEvent{Fd: int32(fd), Events: flags}
-		syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, fd, &event)
+	var eventFd1 syscall.EpollEvent
+	var eventFd2 syscall.EpollEvent
+	var eventWriteFd1 syscall.EpollEvent
+	var eventWriteFd2 syscall.EpollEvent
+
+	events := make([]syscall.EpollEvent, 10)
+	eventsWrite := make([]syscall.EpollEvent, 10)
+
+	eventFd1.Events = syscall.EPOLLIN | syscall.EPOLLRDHUP
+	eventFd1.Fd = int32(fd1)
+	err = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, fd1, &eventFd1)
+	if err != nil {
+		return err
 	}
 
-	register(epfd, fd1, syscall.EPOLLIN|syscall.EPOLLRDHUP)
-	register(epfd, fd2, syscall.EPOLLIN|syscall.EPOLLRDHUP)
-	register(epWritefd, fd1, syscall.EPOLLOUT)
-	register(epWritefd, fd2, syscall.EPOLLOUT)
+	eventFd2.Events = syscall.EPOLLIN | syscall.EPOLLRDHUP
+	eventFd2.Fd = int32(fd2)
+	err = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, fd2, &eventFd2)
+	if err != nil {
+		return err
+	}
 
-	buf := make([]byte, BUF_SIZE)
+	eventWriteFd1.Events = syscall.EPOLLOUT
+	eventWriteFd1.Fd = int32(fd1)
+	err = syscall.EpollCtl(epWritefd, syscall.EPOLL_CTL_ADD, fd1, &eventWriteFd1)
+	if err != nil {
+		return err
+	}
 
+	eventWriteFd2.Events = syscall.EPOLLOUT
+	eventWriteFd2.Fd = int32(fd2)
+	err = syscall.EpollCtl(epWritefd, syscall.EPOLL_CTL_ADD, fd2, &eventWriteFd2)
+	if err != nil {
+		return err
+	}
+
+	b := make([]byte, BUF_SIZE)
 	for {
-		events := make([]syscall.EpollEvent, 10)
-		nr, err := syscall.EpollWait(epfd, events, -1)
-		if err != nil && err != syscall.EINTR {
+		nevents, err := syscall.EpollWait(epfd, events, -1)
+		if err != nil {
+			// goroutine can cause EINTR
+			if err == syscall.EINTR {
+				continue
+			}
+			log.Error("EpollWait")
 			return err
 		}
+		waitEvents := events[:nevents]
 
-		eventsWrite := make([]syscall.EpollEvent, 10)
-		nw, err := syscall.EpollWait(epWritefd, eventsWrite, 0)
-		if err != nil && err != syscall.EINTR {
+		nevents, err = syscall.EpollWait(epWritefd, eventsWrite, 0)
+		if err != nil {
+			// goroutine can cause EINTR
+			if err == syscall.EINTR {
+				continue
+			}
+			log.Error("EpollWait")
 			return err
 		}
+		eventsWritable := eventsWrite[:nevents]
 
-		close := isEpollEventFlagged(events[:nr], fd1, syscall.EPOLLRDHUP) ||
-			isEpollEventFlagged(events[:nr], fd2, syscall.EPOLLRDHUP)
+		close := isEpollEventFlagged(waitEvents, fd1, syscall.EPOLLRDHUP)
+		close = close || isEpollEventFlagged(waitEvents, fd2, syscall.EPOLLRDHUP)
 
-		for _, pair := range [][2]int{{fd1, fd2}, {fd2, fd1}} {
-			readFd, writeFd := pair[0], pair[1]
-			if !isEpollEventFlagged(events[:nr], readFd, syscall.EPOLLIN) ||
-				!isEpollEventFlagged(eventsWrite[:nw], writeFd, syscall.EPOLLOUT) {
+		fds := []int{fd1, fd2}
+		for fdIdx := range fds {
+			logPrefix := fmt.Sprintf("fd%d -> fd%d", fdIdx+1, (fdIdx+2)%(len(fds)+1))
+			readFd := fds[fdIdx]
+			writeFd := fds[(fdIdx+1)%len(fds)]
+
+			if !isEpollEventFlagged(waitEvents, readFd, syscall.EPOLLIN) {
+				continue
+			}
+			close = false
+
+			if !isEpollEventFlagged(eventsWritable, writeFd, syscall.EPOLLOUT) {
 				continue
 			}
 
-			n, _, err := syscall.Recvfrom(readFd, buf, syscall.MSG_DONTWAIT)
-			if err != nil || n == 0 {
+			readSize, _, err := syscall.Recvfrom(readFd, b, syscall.MSG_DONTWAIT)
+			if err != nil {
+				log.Errorf("Read")
 				return err
 			}
-			if _, err := syscall.Write(writeFd, buf[:n]); err != nil {
+
+			if readSize == 0 {
+				log.Debugf("READ SIZE == 0")
+				return nil
+			}
+			log.Debugf("%s Read(size=%d)", logPrefix, readSize)
+
+			writeSize, err := syscall.Write(writeFd, b[:readSize])
+			if err != nil {
+				log.Errorf("%s Write", logPrefix)
 				return err
 			}
+			log.Debugf("%s Write(size=%d)", logPrefix, writeSize)
 		}
 
 		if close {
 			return nil
 		}
 	}
+
+	// return nil
 }
