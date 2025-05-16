@@ -195,36 +195,13 @@ func doProxy(bindProtocol, connectProtocol int) {
 			remoteSockAddr.Port = remotePort
 		}
 
-		// —— 从这里开始替换 —— 
-go func(taskID, origFd int) {
-    // 1）把 fd 包装成 *os.File
-    sockFile := os.NewFile(uintptr(origFd), fmt.Sprintf("proxy-socket-%d", origFd))
-
-    // 2）告诉 Python：它在子进程里要用 fd=3
-    cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
-        "--fd", "3",                         // 固定传 3
-        "--task", strconv.Itoa(taskID),
-    )
-
-    // 3）ExtraFiles[0] 会变成子进程的 fd 3
-    cmd.ExtraFiles = []*os.File{ sockFile }
-
-    // 4）运行并获取输出，方便调试
-    out, err := cmd.CombinedOutput()
-    if err != nil {
-        log.Errorf("logger failed: %v\noutput: %s", err, string(out))
-    } else {
-        log.Infof("logger output: %s", string(out))
-    }
-}(taskCounter, fd2)
-taskCounter++
-// —— 替换到这里结束 —— 
-
-		go handleConnection(fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
+		// 把当前的 taskCounter 传进去，再自增
+		go handleConnection(taskCounter, fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
+		taskCounter++
 	}
 }
 
-func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
+func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
 	defer syscall.Close(fd)
 
 	// Always use standard TCP for the outgoing socket
@@ -265,7 +242,24 @@ func handleConnection(fd int, src, dst *syscall.SockaddrInet4, connectProtocol i
 	}
 
 	log.Printf("proxy finished(%s)", endpoints)
+
+	// —— 在数据转发完毕后，再启动 Python logger —— 
+	sockFile := os.NewFile(uintptr(fd), fmt.Sprintf("proxy-socket-%d", fd))
+	cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
+		"--fd", "3",                         // Python 子进程里 fd=3
+		"--task", strconv.Itoa(taskID),
+	)
+	cmd.ExtraFiles = []*os.File{sockFile}   // 把 sockFile 传给子进程作为 fd 3
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Errorf("logger failed: %v\noutput: %s", err, string(out))
+	} else {
+		log.Infof("logger output: %s", string(out))
+	}
+	// —— logger 调用结束 —— 
+
 	return nil
+
 }
 
 func isEpollEventFlagged(events []syscall.EpollEvent, fd int, flag int) bool {
