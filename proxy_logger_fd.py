@@ -95,18 +95,30 @@ def log_metrics(fd, task_id, output_file):
 # ✅ 参数解析和调用入口
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["persist","log"], required=True,
+        help="persist 只打标记；log 则打标记+记录指标")
     parser.add_argument("--fd", type=int, required=True, help="Socket file descriptor")
     parser.add_argument("--task", type=int, required=True, help="Task ID (调度器 × 文件 × 轮次)")
     parser.add_argument("--output", type=str, default="proxy_metrics.csv", help="Output CSV file")
     args = parser.parse_args()
 
     # 保留 fd 状态
-    mpsched.persist_state(args.fd)
+#    mpsched.persist_state(args.fd)
 
     # 等待连接完成后再记录
 #    time.sleep(0.2)
 
-    log_metrics(args.fd, args.task, args.output)
+ #   log_metrics(args.fd, args.task, args.output)
+
+if args.mode == "persist":
+    # 只打 persist 标记
+    mpsched.persist_state(args.fd)
+    sys.exit(0)
+
+# mode == "log"，才打标记、sleep、再记录
+#mpsched.persist_state(args.fd)
+#time.sleep(0.2)
+log_metrics(args.fd, args.task, args.output)
 
 if __name__ == "__main__":
     main()
