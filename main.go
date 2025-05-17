@@ -202,7 +202,7 @@ func doProxy(bindProtocol, connectProtocol int) {
 }
 
 func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
-	defer syscall.Close(fd)
+//	defer syscall.Close(fd)
 
 	// Always use standard TCP for the outgoing socket
 	rFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
@@ -257,6 +257,8 @@ func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectPr
 		log.Infof("logger output: %s", string(out))
 	}
 	// —— logger 调用结束 —— 
+
+	defer syscall.Close(fd)
 
 	return nil
 
