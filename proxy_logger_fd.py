@@ -104,7 +104,7 @@ def main():
     mpsched.persist_state(args.fd)
 
     # 等待连接完成后再记录
-    time.sleep(0.2)
+#    time.sleep(0.2)
 
     log_metrics(args.fd, args.task, args.output)
 
