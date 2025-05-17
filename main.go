@@ -200,7 +200,7 @@ func doProxy(bindProtocol, connectProtocol int) {
 
     // —— 2）马上同步 persist
     {
-        sockFile := os.NewFile(uintptr(fd), fmt.Sprintf("persist-socket-%d", fd))
+        sockFile := os.NewFile(uintptr(fd2), fmt.Sprintf("persist-socket-%d", fd2))
         cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
             "--mode", "persist",
             "--fd",   "3",
@@ -215,13 +215,12 @@ func doProxy(bindProtocol, connectProtocol int) {
 
     // —— 3）再启动代理处理，并自增计数
 		// 把当前的 taskCounter 传进去，再自增
-		go handleConnection(taskID, fd, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
+		go handleConnection(taskID, fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
 		taskCounter++
 	}
 }
 
 func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
-	defer syscall.Close(fd)
 
 	// Always use standard TCP for the outgoing socket
 	rFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
@@ -229,7 +228,7 @@ func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectPr
 		log.Error(err)
 		return err
 	}
-	defer syscall.Close(rFd)
+	//defer syscall.Close(rFd)
 
 	// Explicitly disable MPTCP (in case mptcp_enabled=2 is set globally)
 	const MPTCP_ENABLED = 42
@@ -277,6 +276,7 @@ func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectPr
        log.Infof("logger output: %s", out)
    }
    sockFile.Close()
+   syscall.Close(fd)
 // —— logger 调用结束 —— 
 
 //	defer syscall.Close(fd)
