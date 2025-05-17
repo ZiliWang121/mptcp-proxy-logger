@@ -195,14 +195,33 @@ func doProxy(bindProtocol, connectProtocol int) {
 			remoteSockAddr.Port = remotePort
 		}
 
+    // —— 1）冻结当前的 taskID
+    taskID := taskCounter
+
+    // —— 2）马上同步 persist
+    {
+        sockFile := os.NewFile(uintptr(fd), fmt.Sprintf("persist-socket-%d", fd))
+        cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
+            "--mode", "persist",
+            "--fd",   "3",
+            "--task", strconv.Itoa(taskID),
+        )
+        cmd.ExtraFiles = []*os.File{ sockFile }
+        if out, err := cmd.CombinedOutput(); err != nil {
+            log.Errorf("persist failed: %v\n%s", err, out)
+        }
+        //sockFile.Close()
+    }
+
+    // —— 3）再启动代理处理，并自增计数
 		// 把当前的 taskCounter 传进去，再自增
-		go handleConnection(taskCounter, fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
+		go handleConnection(taskID, fd, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
 		taskCounter++
 	}
 }
 
 func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
-//	defer syscall.Close(fd)
+	defer syscall.Close(fd)
 
 	// Always use standard TCP for the outgoing socket
 	rFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
@@ -244,21 +263,23 @@ func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectPr
 	log.Printf("proxy finished(%s)", endpoints)
 
 	// —— 在数据转发完毕后，再启动 Python logger —— 
-	sockFile := os.NewFile(uintptr(fd), fmt.Sprintf("proxy-socket-%d", fd))
-	cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
-		"--fd", "3",                         // Python 子进程里 fd=3
-		"--task", strconv.Itoa(taskID),
-	)
-	cmd.ExtraFiles = []*os.File{sockFile}   // 把 sockFile 传给子进程作为 fd 3
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Errorf("logger failed: %v\noutput: %s", err, string(out))
-	} else {
-		log.Infof("logger output: %s", string(out))
-	}
-	// —— logger 调用结束 —— 
+   // —— 在数据转发完毕后，再记录一次指标 —— 
+   sockFile := os.NewFile(uintptr(fd), fmt.Sprintf("proxy-socket-%d", fd))
+   cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
+       "--mode", "log",
+       "--fd",   "3",
+       "--task", strconv.Itoa(taskID),
+   )
+   cmd.ExtraFiles = []*os.File{ sockFile }
+   if out, err := cmd.CombinedOutput(); err != nil {
+       log.Errorf("logger failed: %v\noutput: %s", err, out)
+   } else {
+       log.Infof("logger output: %s", out)
+   }
+   sockFile.Close()
+// —— logger 调用结束 —— 
 
-	defer syscall.Close(fd)
+//	defer syscall.Close(fd)
 
 	return nil
 
