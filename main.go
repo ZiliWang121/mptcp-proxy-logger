@@ -181,23 +181,6 @@ func doProxy(bindProtocol, connectProtocol int) {
 		// —— 1）冻结当前的 taskID
 		taskID := taskCounter
 
-		// —— 2）马上异步调用 persist_state，不阻塞
-		go func(fdCopy, tID int) {
-			sockFile := os.NewFile(uintptr(fdCopy), fmt.Sprintf("persist-socket-%d", fdCopy))
-			cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
-				"--mode", "persist",
-				"--fd", "3",
-				"--task", strconv.Itoa(tID),
-			)
-			cmd.ExtraFiles = []*os.File{sockFile}
-			if out, err := cmd.CombinedOutput(); err != nil {
-				log.Errorf("persist failed: %v\n%s", err, out)
-			} else {
-				log.Infof("persist done: %s", out)
-			}
-			// sockFile.Close()  // Python may still hold it briefly
-		}(fd2, taskID)
-
 		// —— 3）启动代理处理，并自增计数
 		go handleConnection(taskID, fd2, rAddr.(*syscall.SockaddrInet4), remoteSockAddr, connectProtocol)
 		taskCounter++
@@ -205,6 +188,27 @@ func doProxy(bindProtocol, connectProtocol int) {
 }
 
 func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectProtocol int) error {
+
+// 1) persist：在子流还没开始转发前做 SAVE_MASTER
+dupFd, err := syscall.Dup(fd)
+if err != nil {
+    log.Warnf("dup(fd) for persist failed: %v", err)
+} else {
+    persistFile := os.NewFile(uintptr(dupFd), fmt.Sprintf("persist-socket-%d", dupFd))
+    cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
+        "--mode", "persist",
+        "--fd", "3",
+        "--task", strconv.Itoa(taskID),
+    )
+    cmd.ExtraFiles = []*os.File{persistFile}
+    if out, err := cmd.CombinedOutput(); err != nil {
+        log.Errorf("persist failed on dupFd=%d: %v\n%s", dupFd, err, out)
+    } else {
+        log.Infof("persist done on dupFd=%d: %s", dupFd, out)
+    }
+    persistFile.Close()
+}
+
 	// Always use standard TCP for the outgoing socket
 	rFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
 	if err != nil {
@@ -232,30 +236,30 @@ func handleConnection(taskID, fd int, src, dst *syscall.SockaddrInet4, connectPr
 	endpoints := fmt.Sprintf("src=%s:%d dst=%s:%d", srcAddr, src.Port, dstAddr, dst.Port)
 	log.Printf("connected to remote(%s)", endpoints)
 
-	// 在转发过程中异步调用 log，确保 socket 仍然打开
-	go func(fdCopy, tID int) {
-		// 可以调整 Sleep 时间，如果数据太快
-		// time.Sleep(200 * time.Millisecond)
-
-		sockFile := os.NewFile(uintptr(fdCopy), fmt.Sprintf("proxy-socket-%d", fdCopy))
-		cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
-			"--mode", "log",
-			"--fd", "3",
-			"--task", strconv.Itoa(tID),
-		)
-		cmd.ExtraFiles = []*os.File{sockFile}
-		if out, err := cmd.CombinedOutput(); err != nil {
-			log.Errorf("logger failed: %v\noutput: %s", err, out)
-		} else {
-			log.Infof("logger output: %s", out)
-		}
-		// sockFile.Close()
-	}(fd, taskID)
-
 	// 正常转发数据
 	if err := copyFdStream(fd, rFd); err != nil {
 		log.Error(err)
 	}
+
+// 4) log：子流全结束以后再拿一次 MPTCP_INFO
+dupFd2, err := syscall.Dup(fd)
+if err != nil {
+    log.Warnf("dup(fd) for log failed: %v", err)
+} else {
+    logFile := os.NewFile(uintptr(dupFd2), fmt.Sprintf("log-socket-%d", dupFd2))
+    cmd := exec.Command("python3", "/home/vagrant/proxy_logger_fd.py",
+        "--mode", "log",
+        "--fd", "3",
+        "--task", strconv.Itoa(taskID),
+    )
+    cmd.ExtraFiles = []*os.File{logFile}
+    if out, err := cmd.CombinedOutput(); err != nil {
+        log.Errorf("log failed on dupFd2=%d: %v\n%s", dupFd2, err, out)
+    } else {
+        log.Infof("logger output for task %d: %s", taskID, out)
+    }
+    logFile.Close()
+}
 
 	log.Printf("proxy finished(%s)", endpoints)
 	syscall.Close(fd)
