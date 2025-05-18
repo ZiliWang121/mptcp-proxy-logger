@@ -2,7 +2,7 @@
 """
 Receiver with MPTCP subflow metrics (5G / Wi-Fi OFO stats)
 - Retains original receiver_logger_file.py functionality
-- Adds MPTCP OFO queue stats based on local IP to distinguish 5G and Wi-Fi
+- Fixes OFO queue stats collection based on live sampling during connection
 """
 
 import socket
@@ -16,13 +16,13 @@ import mpsched
 # ------------------- Configuration -------------------
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 8888
-#CHUNK_SIZE = 1024
 CHUNK_SIZE = 16 * 1024  # 即 16KB
 SCHEDULER_LIST = ["default", "roundrobin", "redundant", "blest"]
 FILE_LIST = ["8MB.file", "64MB.file"]
 CSV_LOG = "recv_log.csv"
 CSV_SUMMARY = "summary.csv"
-# Local IP to link mapping (customize here)
+
+# IP address mapping to subflows
 IP_5G = "10.60.0.1"
 IP_WIFI = "10.60.0.2"
 # ------------------------------------------------------
@@ -39,19 +39,6 @@ def recv_exact(sock, size):
             raise TimeoutError("Receive timeout")
     return buf
 
-def get_ofo_per_link(fd):
-    """Extract OFO per subflow (mapped to 5G or Wi-Fi based on local IP)"""
-    ofo = {"5G": 0, "Wi-Fi": 0}
-    subs = mpsched.get_sub_info(fd)
-    for sub in subs:
-        local_ip = sub[6]
-        queue_size = sub[7]
-        if local_ip == IP_5G:
-            ofo["5G"] = queue_size
-        elif local_ip == IP_WIFI:
-            ofo["Wi-Fi"] = queue_size
-    return ofo
-
 # Initialize TCP socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -67,7 +54,7 @@ N_ROUNDS = struct.unpack("!I", n_rounds_bytes)[0]
 conn.close()
 print(f"[Server] Received N_ROUNDS = {N_ROUNDS}")
 
-# Load existing CSV_LOG and find the max round number for each Scheduler × File pair
+# Load existing CSV_LOG and find round offsets
 round_offset = defaultdict(int)
 try:
     with open(CSV_LOG, "r") as f:
@@ -80,7 +67,7 @@ try:
 except FileNotFoundError:
     print("[Server] No previous log found, starting fresh.")
 
-# Construct expected test tasks: Scheduler × File × Round
+# Construct expected test tasks
 expected_tasks = []
 for sched in SCHEDULER_LIST:
     for fname in FILE_LIST:
@@ -89,10 +76,9 @@ for sched in SCHEDULER_LIST:
             round_id = base + i + 1
             expected_tasks.append((sched, fname, round_id))
 
-# Stores metrics per Scheduler/File pair
 file_metrics = defaultdict(list)
 
-# Open CSV_LOG for appending
+# Open log file
 file_exists = os.path.exists(CSV_LOG)
 csvfile = open(CSV_LOG, "a", newline='')
 csvwriter = csv.writer(csvfile)
@@ -116,6 +102,10 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
     chunk_count = 0
     start_time = time.time()
 
+    # 初始化 OFO 变量
+    ofo_5g = 0
+    ofo_wifi = 0
+
     try:
         while True:
             try:
@@ -133,10 +123,24 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
             except Exception as e:
                 print(f"[Error] Failed to parse timestamp: {e}")
                 continue
+
             delay_ms = (recv_time - send_ts) * 1000
             delay_sum += delay_ms
             recv_bytes += len(data)
             chunk_count += 1
+
+            # 每轮接收数据后实时获取当前 OFO
+            subs = mpsched.get_sub_info(fd)
+            for sub in subs:
+                # local_ip = sub[5]
+                dst_ip_raw = sub[5]  # 是一个整数，例如 168427522 → "10.60.0.2"
+                local_ip = socket.inet_ntoa(struct.pack("!I", dst_ip_raw))
+                queue_size = sub[6]
+                if local_ip == IP_5G:
+                    ofo_5g = queue_size
+                elif local_ip == IP_WIFI:
+                    ofo_wifi = queue_size
+
     finally:
         conn.close()
 
@@ -144,10 +148,6 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
     duration = end_time - start_time
     avg_delay = delay_sum / chunk_count if chunk_count > 0 else 0
     goodput = (recv_bytes / 1024) / duration if duration > 0 else 0
-
-    ofo_stats = get_ofo_per_link(fd)
-    ofo_5g = ofo_stats["5G"]
-    ofo_wifi = ofo_stats["Wi-Fi"]
 
     if chunk_count == 0:
         print(f"[Error] No data received: {sched}-{fname} Round {round_id}")
