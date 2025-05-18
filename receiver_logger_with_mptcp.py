@@ -131,15 +131,30 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
 
             # 每轮接收数据后实时获取当前 OFO
             subs = mpsched.get_sub_info(fd)
-            for sub in subs:
-                # local_ip = sub[5]
-                dst_ip_raw = sub[5]  # 是一个整数，例如 168427522 → "10.60.0.2"
-                local_ip = socket.inet_ntoa(struct.pack("!I", dst_ip_raw))
-                queue_size = sub[6]
-                if local_ip == IP_5G:
-                    ofo_5g = queue_size
-                elif local_ip == IP_WIFI:
-                    ofo_wifi = queue_size
+
+            print(f"[Debug] get_sub_info returned {len(subs)} subflows")
+
+            for idx, sub in enumerate(subs):
+                try:
+                    dst_ip_raw = sub[5]  # 原始整数 IP
+                    #local_ip = socket.inet_ntoa(struct.pack("!I", dst_ip_raw))
+                    local_ip = socket.inet_ntoa(struct.pack("<I", dst_ip_raw))  # 改成 little-endian（host byte order）
+                    ofo_count = sub[6]
+
+                    print(f"[Debug] Subflow {idx}: IP={local_ip}, OFO={ofo_count}")
+
+                    if local_ip == IP_5G:
+                        ofo_5g = ofo_count
+                        print(f"[Debug] Matched 5G subflow: {local_ip}, OFO_5G={ofo_count}")
+                    elif local_ip == IP_WIFI:
+                        ofo_wifi = ofo_count
+                        print(f"[Debug] Matched Wi-Fi subflow: {local_ip}, OFO_WiFi={ofo_count}")
+                    else:
+                        print(f"[Debug] IP {local_ip} did not match any known interface")
+
+                except Exception as e:
+                    print(f"[Warning] Failed to parse subflow info: {e}")
+
 
     finally:
         conn.close()
