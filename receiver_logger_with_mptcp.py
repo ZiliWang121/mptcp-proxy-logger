@@ -18,7 +18,7 @@ LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 8888
 CHUNK_SIZE = 16 * 1024  # 即 16KB
 SCHEDULER_LIST = ["default", "roundrobin", "redundant", "blest"]
-FILE_LIST = ["8MB.file", "64MB.file"]
+FILE_LIST = ["8MB.file", "256MB.file"]
 CSV_LOG = "recv_log.csv"
 CSV_SUMMARY = "summary.csv"
 
